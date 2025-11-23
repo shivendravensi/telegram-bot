@@ -11,4 +11,4 @@ google-auth-httplib2>=0.1.0
 google-api-python-client>=2.80.0
 
 # Additional utilities
-mimetypes
+# mimetypes is a Python standard library module (no installation needed)
