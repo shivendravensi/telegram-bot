@@ -1,7 +1,0 @@
-services:
-  - type: worker
-    name: telegram-file-transfer-bot
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot_render_ram_optimized.py
