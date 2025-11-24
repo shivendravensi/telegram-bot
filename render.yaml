@@ -1,8 +1,7 @@
 services:
-  - type: web
+  - type: worker
     name: telegram-file-transfer-bot
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot_master.py
-    healthCheckPath: /
+    startCommand: python bot_render.py
