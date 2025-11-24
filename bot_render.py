@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram Bot with Google Drive Integration - RAM Optimized for Free Tier
-Handles large files (200MB-2GB) within 512MB RAM constraints using streaming approach
+Telegram Bot with Google Drive Integration - OAuth Fixed
+Handles large files with proper OAuth scope configuration
 """
 
 import logging
 import os
 import mimetypes
-import io
 import tempfile
 import shutil
 from datetime import datetime
@@ -35,27 +34,71 @@ class GoogleDriveUploader:
         self.setup_service()
     
     def setup_service(self):
-        """Initialize Google Drive service"""
-        SCOPES = ['https://www.googleapis.com/auth/drive.file']
+        """Initialize Google Drive service with proper OAuth handling"""
+        # Correct scopes for Google Drive file operations
+        SCOPES = [
+            'https://www.googleapis.com/auth/drive',
+            'https://www.googleapis.com/auth/drive.file'
+        ]
         
         try:
-            # Load credentials
+            logger.info("Initializing Google Drive service...")
+            
+            # Load existing credentials
             creds = None
             if os.path.exists(self.token_path):
-                creds = Credentials.from_authorized_user_file(self.token_path, SCOPES)
+                try:
+                    creds = Credentials.from_authorized_user_file(self.token_path, SCOPES)
+                    logger.info("Loaded existing credentials")
+                except Exception as e:
+                    logger.warning(f"Failed to load existing credentials: {e}")
+                    creds = None
             
-            # Refresh or get new credentials
+            # Handle credential refresh or creation
             if not creds or not creds.valid:
                 if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
-                else:
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        self.credentials_path, SCOPES)
-                    creds = flow.run_local_server(port=0)
+                    try:
+                        logger.info("Refreshing existing credentials...")
+                        creds.refresh(Request())
+                        logger.info("Credentials refreshed successfully")
+                    except Exception as e:
+                        logger.error(f"Failed to refresh credentials: {e}")
+                        creds = None
                 
-                # Save credentials
-                with open(self.token_path, 'w') as token:
-                    token.write(creds.to_json())
+                # If no valid credentials, create new ones
+                if not creds or not creds.valid:
+                    try:
+                        logger.info("Creating new OAuth flow...")
+                        flow = InstalledAppFlow.from_client_secrets_file(
+                            self.credentials_path, SCOPES)
+                        
+                        # Use a method that works in server environment
+                        creds = flow.run_local_server(
+                            port=0,
+                            open_browser=False,
+                            prompt='consent'
+                        )
+                        logger.info("New credentials created successfully")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to create new credentials: {e}")
+                        # Try alternative method for server environments
+                        try:
+                            logger.info("Trying alternative OAuth method...")
+                            creds = flow.run_console(prompt='consent')
+                            logger.info("Credentials created via console method")
+                        except Exception as e2:
+                            logger.error(f"Alternative OAuth method failed: {e2}")
+                            raise Exception(f"OAuth setup failed: {e2}")
+                
+                # Save new credentials
+                if creds and creds.valid:
+                    try:
+                        with open(self.token_path, 'w') as token:
+                            token.write(creds.to_json())
+                        logger.info("Credentials saved successfully")
+                    except Exception as e:
+                        logger.warning(f"Failed to save credentials: {e}")
             
             # Build service
             self.service = build('drive', 'v3', credentials=creds)
@@ -63,15 +106,26 @@ class GoogleDriveUploader:
             
         except Exception as e:
             logger.error(f"Failed to initialize Google Drive service: {e}")
-            raise
+            # Log detailed error information
+            if "invalid_scope" in str(e):
+                logger.error("OAuth scope error detected. Checking credentials file...")
+                if os.path.exists(self.credentials_path):
+                    logger.info("Credentials file exists, checking OAuth configuration...")
+                else:
+                    logger.error("OAuth credentials file not found!")
+            
+            raise Exception(f"Google Drive service initialization failed: {e}")
     
     def get_or_create_folder(self, folder_name="Telegram Files"):
         """Get or create a folder in Google Drive"""
         try:
+            logger.info(f"Looking for folder: {folder_name}")
+            
             # Try to find existing folder
             results = self.service.files().list(
                 q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'",
-                fields='files(id, name)'
+                fields='files(id, name)',
+                pageSize=10
             ).execute()
             
             items = results.get('files', [])
@@ -81,6 +135,7 @@ class GoogleDriveUploader:
                 logger.info(f"Using existing folder: {folder_name} (ID: {folder_id})")
             else:
                 # Create new folder
+                logger.info(f"Creating new folder: {folder_name}")
                 folder_metadata = {
                     'name': folder_name,
                     'mimeType': 'application/vnd.google-apps.folder'
@@ -96,10 +151,13 @@ class GoogleDriveUploader:
             
         except HttpError as e:
             logger.error(f"Error handling folder: {e}")
+            raise Exception(f"Folder operation failed: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error in folder operation: {e}")
             raise
 
     def upload_chunked_file(self, file_path, file_name, folder_id):
-        """Upload large file using chunked approach with temporary files"""
+        """Upload large file using chunked approach"""
         try:
             # Get file size
             file_size = os.path.getsize(file_path)
@@ -125,6 +183,8 @@ class GoogleDriveUploader:
                 else:
                     mime_type = 'application/octet-stream'
             
+            logger.info(f"Detected MIME type: {mime_type}")
+            
             # Create file metadata
             file_metadata = {
                 'name': file_name,
@@ -132,7 +192,6 @@ class GoogleDriveUploader:
             }
             
             # Use MediaFileUpload with chunked approach
-            # MediaFileUpload handles chunking internally with the file
             media = MediaFileUpload(
                 file_path,
                 mimetype=mime_type,
@@ -140,49 +199,88 @@ class GoogleDriveUploader:
                 resumable=True
             )
             
-            # Upload file with progress callback
+            # Upload file
+            logger.info("Starting file upload...")
             request = self.service.files().create(
                 body=file_metadata,
                 media_body=media,
                 fields='id,webViewLink'
             )
             
-            # Execute upload with retry logic for large files
+            # Execute upload with progress tracking
             file = None
             response = None
-            while response is None:
-                status, response = request.next_chunk()
-                if status:
-                    progress = (status.progress() * 100)
-                    logger.info(f"Upload progress: {progress:.1f}%")
+            upload_attempts = 0
+            max_attempts = 3
+            
+            while response is None and upload_attempts < max_attempts:
+                try:
+                    status, response = request.next_chunk()
+                    if status:
+                        progress = (status.progress() * 100)
+                        logger.info(f"Upload progress: {progress:.1f}%")
+                except HttpError as e:
+                    if e.resp.status in [500, 502, 503, 504]:
+                        upload_attempts += 1
+                        logger.warning(f"Upload attempt {upload_attempts} failed, retrying...")
+                        if upload_attempts >= max_attempts:
+                            raise
+                    else:
+                        raise
             
             file = response
             
+            if not file:
+                raise Exception("Upload failed - no response received")
+            
+            logger.info(f"File uploaded successfully: {file.get('id')}")
+            
             # Make file publicly viewable
-            permission = {'role': 'reader', 'type': 'anyone'}
-            self.service.permissions().create(fileId=file.get('id'), body=permission).execute()
+            try:
+                permission = {'role': 'reader', 'type': 'anyone'}
+                self.service.permissions().create(
+                    fileId=file.get('id'), 
+                    body=permission
+                ).execute()
+                logger.info("File permissions set successfully")
+            except Exception as e:
+                logger.warning(f"Failed to set file permissions: {e}")
             
             # Get shareable link
             file_id = file.get('id')
-            file = self.service.files().get(fileId=file_id, fields='id,webViewLink').execute()
+            file_info = self.service.files().get(
+                fileId=file_id, 
+                fields='id,webViewLink'
+            ).execute()
             
             return {
                 'id': file['id'],
-                'webViewLink': file['webViewLink'],
+                'webViewLink': file_info['webViewLink'],
                 'size': file_size
             }
             
         except HttpError as e:
             logger.error(f"Media upload error: {e}")
-            raise
+            if e.resp.status == 403:
+                raise Exception("Permission denied. Check your Google Drive API quota and permissions.")
+            elif e.resp.status == 400:
+                raise Exception("Bad request. Check file format and size.")
+            else:
+                raise Exception(f"Google Drive API error: {e}")
         except Exception as e:
             logger.error(f"Unexpected upload error: {e}")
             raise
 
 class TelegramFileBot:
     def __init__(self):
-        self.uploader = GoogleDriveUploader()
-        self.folder_id = self.uploader.get_or_create_folder()
+        try:
+            logger.info("Initializing TelegramFileBot...")
+            self.uploader = GoogleDriveUploader()
+            self.folder_id = self.uploader.get_or_create_folder()
+            logger.info(f"Bot initialized successfully with folder ID: {self.folder_id}")
+        except Exception as e:
+            logger.error(f"Bot initialization failed: {e}")
+            raise
         
     async def handle_start(self, update: Update, context):
         """Handle /start command"""
@@ -254,6 +352,13 @@ Contact the bot administrator if you encounter issues.
     
     async def handle_status(self, update: Update, context):
         """Handle /status command"""
+        try:
+            # Test Google Drive connection
+            self.uploader.service.about().get(fields='storageQuota').execute()
+            drive_status = "✅ Connected"
+        except Exception as e:
+            drive_status = f"❌ Error: {str(e)[:50]}..."
+        
         status_msg = f"""
 📊 **Bot Status**
 
@@ -263,7 +368,7 @@ Contact the bot administrator if you encounter issues.
 🔗 **Folder ID:** `{self.folder_id}`
 
 **Google Drive:**
-✅ Service Connected
+{drive_status}
 ✅ Folder Ready
 🔄 **Cloud Status:** Online
 
@@ -302,7 +407,7 @@ The bot is ready to receive your files! 🚀
                 await update.message.reply_text("❌ Unsupported file type")
                 return
             
-            # Check if file is too large (Telegram bot API limit)
+            # Check file size
             file_size_mb = file.file_size / (1024 * 1024)
             if file_size_mb > 50:
                 await update.message.reply_text(
@@ -321,7 +426,7 @@ The bot is ready to receive your files! 🚀
                 f"🔄 Downloading from Telegram..."
             )
             
-            # Download file to temporary location using streaming
+            # Download and upload file
             await self._upload_large_file_streaming(file, file_name, processing_msg)
             
         except Exception as e:
@@ -335,7 +440,7 @@ The bot is ready to receive your files! 🚀
             # Get file from Telegram
             telegram_file = await file.get_file()
             
-            # Create temporary file (more efficient than memory for large files)
+            # Create temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='_telegram_upload') as temp_file:
                 temp_file_path = temp_file.name
             
@@ -380,7 +485,12 @@ The bot is ready to receive your files! 🚀
             
         except Exception as e:
             logger.error(f"Upload error: {e}")
-            await processing_msg.edit_text(f"❌ Upload failed: {str(e)}")
+            error_msg = str(e)
+            if "quota" in error_msg.lower():
+                error_msg = "Google Drive quota exceeded. Please free up space in your Drive."
+            elif "permission" in error_msg.lower():
+                error_msg = "Permission denied. Check your Google Drive API settings."
+            await processing_msg.edit_text(f"❌ Upload failed: {error_msg}")
         finally:
             # Clean up temporary file
             if temp_file_path and os.path.exists(temp_file_path):
@@ -424,7 +534,12 @@ def main():
         return
     
     # Create bot instance
-    bot = TelegramFileBot()
+    try:
+        bot = TelegramFileBot()
+        logger.info("Bot instance created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create bot instance: {e}")
+        return
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
@@ -444,7 +559,10 @@ def main():
     
     # Start bot
     logger.info("Starting Telegram bot...")
-    application.run_polling()
+    try:
+        application.run_polling()
+    except Exception as e:
+        logger.error(f"Bot failed to start: {e}")
 
 if __name__ == '__main__':
     main()
